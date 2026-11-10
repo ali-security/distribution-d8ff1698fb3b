@@ -1,12 +1,7 @@
 name: build
 
 on:
-  push:
-    branches:
-      - 'release/*'
-    tags:
-      - 'v*'
-  pull_request:
+  workflow_dispatch:
 
 env:
   DOCKERHUB_SLUG: distribution/distribution
@@ -14,6 +9,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       -
         name: Checkout

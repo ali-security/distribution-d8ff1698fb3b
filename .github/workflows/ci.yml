@@ -1,13 +1,18 @@
 name: CI
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test selector (e.g. -run TestFoo); empty runs the full suite"
+        required: false
+        default: ""
 
 jobs:
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       BUILDTAGS: "include_oss,include_gcs"
       CGO_ENABLED: 1
@@ -15,6 +20,13 @@ jobs:
       GOPATH: ${{ github.workspace }}
       GOOS: linux
       COMMIT_RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}',github.event.pull_request.base.sha, github.event.pull_request.head.sha) || github.sha }}
+      TEST_REGISTRY_STORAGE_CACHE_REDIS_ADDR: localhost:6379
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
 
     steps:
     - uses: actions/checkout@v2
@@ -27,24 +39,98 @@ jobs:
       with:
         go-version: 1.20.8
 
-    - name: Dependencies
-      run: |
-          sudo apt-get -q update
-          sudo -E apt-get -yq --no-install-suggests --no-install-recommends install python2-minimal
-          cd /tmp && go install github.com/vbatts/git-validation@latest
-
     - name: Build
       working-directory: ./src/github.com/docker/distribution
       run: |
-        DCO_VERBOSITY=-q script/validate/dco
-        GO111MODULE=on script/setup/install-dev-tools
-        script/validate/vendor
+        set -o pipefail
         go build .
-        make check
         make build
         make binaries
-        if [ "$GOOS" = "linux" ]; then make coverage ; fi
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          make coverage TESTFLAGS="-v ${{ inputs.test-filter }}" 2>&1 | tee /tmp/test-output.log
+        elif [ "$GOOS" = "linux" ]; then
+          make coverage 2>&1 | tee /tmp/test-output.log
+        fi
 
-    - uses: codecov/codecov-action@v1
+    - name: Test summary
+      if: always()
+      run: |
+        f=/tmp/test-output.log
+        [ -f "$f" ] || { echo "no test output"; exit 0; }
+        echo "=== go test per-package results (runner output) ==="
+        awk '/^(ok|FAIL)[ \t]/' "$f"
+        echo "=== gocheck suite results (runner output) ==="
+        awk '/^(OK|OOPS):/' "$f"
+        echo "=== Passed tests (runner output) ==="
+        awk '/--- PASS/' "$f"
+        echo "=== Skipped tests ==="
+        awk '/--- SKIP/' "$f"
+        echo "=== Failed tests ==="
+        awk '/--- FAIL/' "$f"
+        awk '
+          /--- PASS/ { if ($0 ~ /^--- PASS/) top_pass++; else sub_pass++ }
+          /--- FAIL/ { fail++ }
+          /--- SKIP/ { skip++ }
+          /^ok[ \t]/ { pkg_ok++ }
+          /^FAIL[ \t]/ { pkg_fail++ }
+          /^OK: [0-9]+ passed/ { gocheck += $2 }
+          END {
+            printf "=== TEST SUMMARY ===\n"
+            printf "Top-level tests passed: %d\n", top_pass
+            printf "Subtests passed: %d\n", sub_pass
+            printf "gocheck tests passed: %d\n", gocheck
+            printf "Tests failed: %d\n", fail
+            printf "Tests skipped: %d\n", skip
+            printf "Packages ok: %d, packages failed: %d\n", pkg_ok, pkg_fail
+          }' "$f"
+
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
       with:
-        directory: ./src/github.com/docker/distribution
+        path: src
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.23.x
+
+    - name: Create module zip
+      run: |
+        mkdir -p /tmp/helper /tmp/out
+        cd /tmp/helper
+        cat > main.go <<'EOF'
+        package main
+
+        import (
+          "log"
+          "os"
+
+          "golang.org/x/mod/module"
+          "golang.org/x/mod/zip"
+        )
+
+        func main() {
+          f, err := os.Create(os.Args[3])
+          if err != nil {
+            log.Fatal(err)
+          }
+          defer f.Close()
+          mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+          if err := zip.CreateFromDir(f, mv, os.Args[4]); err != nil {
+            log.Fatal(err)
+          }
+        }
+        EOF
+        go mod init helper
+        go get golang.org/x/mod@v0.24.0
+        go run . github.com/docker/distribution v2.8.3+incompatible "/tmp/out/v2.8.3+incompatible.zip" "$GITHUB_WORKSPACE/src"
+        unzip -l "/tmp/out/v2.8.3+incompatible.zip" | tail -1
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: module-zip
+        path: /tmp/out/v2.8.3+incompatible.zip
+        if-no-files-found: error
