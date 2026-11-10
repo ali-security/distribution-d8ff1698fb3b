@@ -210,7 +210,34 @@ func (rsrbds *repositoryScopedRedisBlobDescriptorService) Clear(ctx context.Cont
 		return distribution.ErrBlobUnknown
 	}
 
-	return rsrbds.upstream.Clear(ctx, dgst)
+	// Atomically revoke the repository membership and the repository scoped
+	// descriptor along with the shared descriptor, so that a peer repository
+	// repopulating the shared descriptor cannot restore access to this one.
+	if err := conn.Send("MULTI"); err != nil {
+		return err
+	}
+	if err := conn.Send("SREM", rsrbds.repositoryBlobSetKey(rsrbds.repo), dgst); err != nil {
+		return err
+	}
+	if err := conn.Send("DEL", rsrbds.blobDescriptorHashKey(dgst)); err != nil {
+		return err
+	}
+	if err := conn.Send("HDEL", rsrbds.upstream.blobDescriptorHashKey(dgst), "digest", "size", "mediatype"); err != nil {
+		return err
+	}
+
+	replies, err := redis.Values(conn.Do("EXEC"))
+	if err != nil {
+		return err
+	}
+
+	for _, reply := range replies {
+		if replyErr, ok := reply.(redis.Error); ok {
+			return replyErr
+		}
+	}
+
+	return nil
 }
 
 func (rsrbds *repositoryScopedRedisBlobDescriptorService) SetDescriptor(ctx context.Context, dgst digest.Digest, desc distribution.Descriptor) error {
